@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
-import os #provides ways to access the Operating System and allows us to read the environment variables
+import os 
 
 load_dotenv()
 
@@ -10,110 +10,172 @@ app = Flask(__name__)
 uri = os.getenv('URI')
 user = os.getenv("USERNAME")
 password = os.getenv("PASSWORD")
-driver = GraphDatabase.driver(uri, auth=(user, password),database="neo4j")
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "test1234"))
 
-def get_movies(tx):
-    query = "MATCH (m:Movie) RETURN m"
+def get_employees(tx, sort=None, filter=None):
+    query="MATCH (m:Employee)"
+    if filter:
+        query+=f" WHERE {filter}"
+    query+=" RETURN m"
+    if sort:
+        query+=f" ORDER BY m.{sort}"
+    results=tx.run(query).data()
+    employees=[{'name': result['m']['name'], 'stanowisko' : result['m']['position']} for result in results]
+    return employees
+
+@app.route('/employees', methods=['GET'])
+def get_employees_route():
+    sort = request.args.get('sort')
+    filter = request.args.get('filter')
+    with driver.session() as session:
+        pracownicy = session.execute_read(get_employees, sort, filter)
+    response = {'pracownicy': pracownicy}
+    return jsonify(response)
+
+def czy_istnieje_pracownik(tx, name):
+    query = "MATCH (m:Employee {name: $name}) RETURN m"
+    result = tx.run(query, name=name).data()
+    return bool(result)
+
+def czy_istnieje_department(tx, name):
+    query = "MATCH (d:Department {name: $name}) RETURN d"
+    results = tx.run(query, name=name).data()
+    return bool(results)
+
+@app.route('/employees', methods=['POST'])
+def add_employee():
+    name = request.json['name']
+    position = request.json['position']
+    department = request.json['department']
+    with driver.session() as session:
+        if not session.execute_read(czy_istnieje_pracownik, name):
+            if session.execute_read(czy_istnieje_department, department):
+                query = "MATCH (d:Department {name: $department}) CREATE (m:Employee {name: $name, position: $position})-[:WORKS_IN]->(d)"
+                session.run(query, name=name, position=position, department=department)
+                response = {'message': f'Employee {name} added to {department}'}
+            else:
+                response = {'message': f'Department {department} does not exist'}
+        else:
+            response = {'message': f'Employee {name} already exists'}
+    return jsonify(response)
+
+def czy_istnieje_po_id(tx, id):
+    query = f"MATCH (e:Employee) WHERE id(e)=$id RETURN e"
+    result = tx.run(query, id=int(id)).data()
+    return bool(result)
+
+def edytuj_pracownika(tx, id, name, position, department):
+    query = f"MATCH (e:Employee) WHERE id(e)=$id SET e.name=$name, e.position=$position"
+    if department:
+        query += ", (e)-[:WORKS_IN]->(:Department {name: $department})"
+    tx.run(query, id=int(id), name=name, position=position, department=department)
+
+@app.route('/employees/<id>', methods=['PUT'])
+def edit_employee(id):
+    name = request.json['name']
+    position = request.json['position']
+    department = request.json['department']
+    with driver.session() as session:
+        if session.execute_read(czy_istnieje_po_id, id):
+            session.execute_write(edytuj_pracownika, id, name, position, department)
+            response = {'message': f'Udało się edytować pracownika o id {id}'}
+        else:
+            response = {'message': f'Nie ma takiego pracownika'}
+    return jsonify(response)
+
+def usun_pracownika(tx, id):
+    query = f"MATCH (e:Employee) WHERE id(e)=$id DETACH DELETE e"
+    tx.run(query, id=int(id))
+def usun_department(tx, id):
+    query = (
+        "MATCH (d:Department)<-[r:MANAGES]-(m:Employee) "
+        "WHERE ID(m) = $id "
+        "WITH d, m, r "
+        "DELETE d, r "
+        "WITH m "
+        "SET m:EmployeeWithoutDepartment"
+    )
+    tx.run(query, id=id)
+@app.route('/employees/<id>', methods=['DELETE'])
+def delete_employee(id):
+    with driver.session() as session:
+        if session.execute_read(czy_istnieje_po_id, id):
+            session.execute_write(usun_department, id)
+            session.execute_write(usun_pracownika, id)
+            response = {'message': f'Udało się usunąć pracownika o id {id}'}
+        else:
+            response = {'message': f'Nie ma takiego pracownika'}
+    return jsonify(response)
+
+def czy_manager(tx, id):
+    query = (
+        "MATCH (e:Employee)-[r]->() "
+        "WHERE id(e) = $id "
+        "RETURN r"
+    )
+    results = tx.run(query, id=int(id)).data()
+    is_manager = any(result['r'][1] == 'MANAGES' for result in results)
+    return is_manager
+
+def jaki_department(tx, id):
+    query = ("MATCH (e:Employee)-[:WORKS_IN]->(d:Department) "
+                "WHERE id(e) = $id "
+                "RETURN d")
+    result = tx.run(query, id=int(id)).data()
+    department = result[0]['d']['name']
+    return department
+
+def ile_pracownikow(tx, department):
+    query = ("MATCH (e:Employee)-[:WORKS_IN]->(d:Department) "
+                "WHERE d.name = $department "
+                "RETURN count(e) as count")
+    result = tx.run(query, department=department).data()
+    return result
+@app.route('/employees/<id>/subordinates', methods=['GET'])
+def get_subordinates(id):
+    with driver.session() as session:
+        if session.execute_read(czy_istnieje_po_id, id):
+            if session.execute_read(czy_manager, id):
+                department = session.execute_read(jaki_department, id)
+                result = session.execute_read(ile_pracownikow, department)
+                response = {'message': f'W dziale {department} jest {result[0]["count"]} pracownikow'}
+            else:
+                response = {'message': f'Pracownik o id {id} nie jest managerem'}
+        else:
+            response = {'message': f'Nie ma takiego pracownika'}
+    return jsonify(response)
+
+def lista_departamentow(tx, order_by, desc=False):
+    query = f"MATCH (d:Department) RETURN d ORDER BY d.{order_by} {'DESC' if desc else ''}"
     results = tx.run(query).data()
-    movies = [{'title': result['m']['title'], 'released': result['m']['released']} for result in results]
-    return movies
+    return results
 
-@app.route('/movies', methods=['GET'])
-def get_movies_route():
+@app.route('/departments', methods=['GET'])
+def get_departments():
+    order_by = request.args.get('order_by', 'name')
+    desc = request.args.get('desc', '').lower() == 'true' 
     with driver.session() as session:
-        movies = session.read_transaction(get_movies)
-
-    response = {'movies': movies}
+        departments = session.read_transaction(lista_departamentow, order_by, desc)
+    response = {'departments': departments}
     return jsonify(response)
 
-def get_movie(tx, title):
-    query = "MATCH (m:Movie) WHERE m.title=$title RETURN m"
-    result = tx.run(query, title=title).data()
+def pracownicy_departamentu(tx, department_id):
+    query = (
+        "MATCH (department:Department)-[:HAS_EMPLOYEE]->(employee:Employee) "
+        "WHERE ID(department) = $department_id "
+        "RETURN employee"
+    )
+    results = tx.run(query, department_id=department_id).data()
+    return results
 
-    if not result:
-        return None
-    else:
-        return {'title': result[0]['m']['title'], 'released': result[0]['m']['released']}
-
-@app.route('/movies/<string:title>', methods=['GET'])
-def get_movie_route(title):
+@app.route('/departments/<int:department_id>/employees', methods=['GET'])
+def get_department_employees(department_id):
     with driver.session() as session:
-        movie = session.read_transaction(get_movie, title)
-
-    if not movie:
-        response = {'message': 'Movie not found'}
-        return jsonify(response), 404
-    else:
-        response = {'movie': movie}
-        return jsonify(response)
-
-def add_movie(tx, title, year):
-    query = "CREATE (m:Movie {title: $title, released: $released})"
-    tx.run(query, title=title, released=year)
-
-
-@app.route('/movies', methods=['POST'])
-def add_movie_route():
-    title = request.json['title']
-    year = request.json['released']
-
-    with driver.session() as session:
-        session.write_transaction(add_movie, title, year)
-
-    response = {'status': 'success'}
+        if not session.execute_read(czy_istnieje_department, department_id):
+            return jsonify({'message': f'Department with ID {department_id} does not exist'}), 404
+        employees = session.read_transaction(pracownicy_departamentu, department_id)
+    response = {'employees': employees}
     return jsonify(response)
-
-
-def update_movie(tx, title, new_title, new_year):
-    query = "MATCH (m:Movie) WHERE m.title=$title RETURN m"
-    result = tx.run(query, title=title).data()
-
-    if not result:
-        return None
-    else:
-        query = "MATCH (m:Movie) WHERE m.title=$title SET m.title=$new_title, m.released=$new_year"
-        tx.run(query, title=title, new_title=new_title, new_year=new_year)
-        return {'title': new_title, 'year': new_year}
-
-
-@app.route('/movies/<string:title>', methods=['PUT'])
-def update_movie_route(title):
-    new_title = request.json['title']
-    new_year = request.json['released']
-
-    with driver.session() as session:
-        movie = session.write_transaction(update_movie, title, new_title, new_year)
-
-    if not movie:
-        response = {'message': 'Movie not found'}
-        return jsonify(response), 404
-    else:
-        response = {'status': 'success'}
-        return jsonify(response)
-
-
-def delete_movie(tx, title):
-    query = "MATCH (m:Movie) WHERE m.title=$title RETURN m"
-    result = tx.run(query, title=title).data()
-
-    if not result:
-        return None
-    else:
-        query = "MATCH (m:Movie) WHERE m.title=$title DETACH DELETE m"
-        tx.run(query, title=title)
-        return {'title': title}
-
-@app.route('/movies/<string:title>', methods=['DELETE'])
-def delete_movie_route(title):
-    with driver.session() as session:
-        movie = session.write_transaction(delete_movie, title)
-
-    if not movie:
-        response = {'message': 'Movie not found'}
-        return jsonify(response), 404
-    else:
-        response = {'status': 'success'}
-        return jsonify(response)
 
 if __name__ == '__main__':
     app.run()
